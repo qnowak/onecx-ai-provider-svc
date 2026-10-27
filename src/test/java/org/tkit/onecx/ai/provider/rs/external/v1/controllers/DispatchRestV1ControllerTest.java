@@ -24,6 +24,7 @@ import org.tkit.quarkus.test.WithDBData;
 import gen.org.tkit.onecx.ai.provider.rs.external.v1.model.AgentFilterDTOV1;
 import gen.org.tkit.onecx.ai.provider.rs.external.v1.model.ChatMessageDTOV1;
 import gen.org.tkit.onecx.ai.provider.rs.external.v1.model.ChatRequestDTOV1;
+import gen.org.tkit.onecx.ai.provider.rs.external.v1.model.ProblemDetailResponseDTOV1;
 import gen.org.tkit.onecx.ai.provider.rs.external.v1.model.RequestContextDTOV1;
 import gen.org.tkit.onecx.ai.provider.runtime.client.model.RuntimeChatResponse;
 import io.quarkiverse.mockserver.test.InjectMockServerClient;
@@ -163,7 +164,7 @@ class DispatchRestV1ControllerTest extends AbstractTest {
     }
 
     @Test
-    @DisplayName("Test runtime API responds with error that becomes BAD_REQUEST (Quarkus REST client throws on non-2xx)")
+    @DisplayName("Test runtime API responds with error that becomes RUNTIME_ERROR (502)")
     void chatTestRuntimeErrorResponseThrowsException() {
         var request = new ChatRequestDTOV1();
         var message = new ChatMessageDTOV1();
@@ -179,18 +180,19 @@ class DispatchRestV1ControllerTest extends AbstractTest {
                         .withContentType(MediaType.APPLICATION_JSON)
                         .withBody(JsonBody.json(new RuntimeChatResponse().message("Error from runtime"))));
 
-        // The exception is caught and returns BAD_REQUEST with error message
+        // Runtime non-2xx is mapped to a structured, non-retryable 502 without the runtime body
         var response = given()
                 .auth().oauth2(getKeycloakClientToken("testClient"))
                 .contentType(APPLICATION_JSON)
                 .body(request)
                 .post()
                 .then()
-                .statusCode(Response.Status.BAD_REQUEST.getStatusCode())
+                .statusCode(Response.Status.BAD_GATEWAY.getStatusCode())
                 .extract()
-                .asString();
+                .as(ProblemDetailResponseDTOV1.class);
 
-        assertThat(response).contains("Error invoking runtime chat API");
+        assertThat(response.getErrorCode()).isEqualTo("RUNTIME_ERROR");
+        assertThat(response.getDetail()).doesNotContain("Error from runtime");
     }
 
     @Test
@@ -228,7 +230,7 @@ class DispatchRestV1ControllerTest extends AbstractTest {
     }
 
     @Test
-    @DisplayName("Test runtime API responds with GATEWAY_TIMEOUT (REST client throws exception)")
+    @DisplayName("Test runtime API responds with GATEWAY_TIMEOUT that becomes RUNTIME_TIMEOUT (504)")
     void chatTestRuntimeGatewayTimeoutException() {
         var request = new ChatRequestDTOV1();
         var message = new ChatMessageDTOV1();
@@ -244,18 +246,18 @@ class DispatchRestV1ControllerTest extends AbstractTest {
                         .withContentType(MediaType.APPLICATION_JSON)
                         .withBody(JsonBody.json("")));
 
-        // The exception is caught and returns BAD_REQUEST (converted by responseStatus)
+        // Runtime timeout is mapped to a retryable 504 with a structured body
         var response = given()
                 .auth().oauth2(getKeycloakClientToken("testClient"))
                 .contentType(APPLICATION_JSON)
                 .body(request)
                 .post()
                 .then()
-                .statusCode(Response.Status.BAD_REQUEST.getStatusCode())
+                .statusCode(Response.Status.GATEWAY_TIMEOUT.getStatusCode())
                 .extract()
-                .asString();
+                .as(ProblemDetailResponseDTOV1.class);
 
-        assertThat(response).contains("Error invoking runtime chat API");
+        assertThat(response.getErrorCode()).isEqualTo("RUNTIME_TIMEOUT");
     }
 
     @Test
@@ -272,17 +274,18 @@ class DispatchRestV1ControllerTest extends AbstractTest {
                 .withId(MOCK_ID)
                 .error(org.mockserver.model.HttpError.error().withDropConnection(true));
 
+        // Runtime not reachable is mapped to a retryable 503 without exposing the connection error
         var response = given()
                 .auth().oauth2(getKeycloakClientToken("testClient"))
                 .contentType(APPLICATION_JSON)
                 .body(request)
                 .post()
                 .then()
-                .statusCode(Response.Status.BAD_REQUEST.getStatusCode())
+                .statusCode(Response.Status.SERVICE_UNAVAILABLE.getStatusCode())
                 .extract()
-                .asString();
+                .as(ProblemDetailResponseDTOV1.class);
 
-        assertThat(response).contains("Error invoking runtime chat API");
+        assertThat(response.getErrorCode()).isEqualTo("RUNTIME_UNAVAILABLE");
     }
 
     @Test

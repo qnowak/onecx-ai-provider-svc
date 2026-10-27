@@ -33,6 +33,7 @@ import org.tkit.onecx.ai.provider.domain.models.enums.ToolPermission;
 import org.tkit.onecx.ai.provider.test.AbstractTest;
 
 import gen.org.tkit.onecx.ai.provider.rs.external.v1.model.ChatRequestDTOV1;
+import gen.org.tkit.onecx.ai.provider.rs.external.v1.model.ProblemDetailResponseDTOV1;
 import gen.org.tkit.onecx.ai.provider.rs.external.v1.model.RequestContextDTOV1;
 import gen.org.tkit.onecx.ai.provider.runtime.client.api.RuntimeInternalApi;
 import gen.org.tkit.onecx.ai.provider.runtime.client.model.RuntimeChatRequest;
@@ -71,6 +72,7 @@ class ChatDispatchServiceTest extends AbstractTest {
 
         try (var response = chatDispatchService.chat(request)) {
             assertThat(response.getStatus()).isEqualTo(Response.Status.NOT_FOUND.getStatusCode());
+            assertProblem(response, ChatDispatchService.AGENT_NOT_FOUND);
         }
     }
 
@@ -119,70 +121,86 @@ class ChatDispatchServiceTest extends AbstractTest {
     }
 
     @Test
-    void chat_agentRuntimeTimeout_returnsGatewayTimeout() {
+    void chat_agentRuntimeTimeout_returnsRetryableGatewayTimeout() {
         var agent = new Agent();
         when(agentService.findAgentByRequestContext(any())).thenReturn(agent);
         var request = new ChatRequestDTOV1();
         var runtimeResponse = new RuntimeChatResponse();
-        runtimeResponse.setMessage("timeout");
+        runtimeResponse.setMessage("raw runtime timeout details");
         when(providerRuntimeClient.chat(any()))
                 .thenReturn(Response.status(Response.Status.GATEWAY_TIMEOUT).entity(runtimeResponse).build());
 
         try (var response = chatDispatchService.chat(request)) {
             assertThat(response.getStatus()).isEqualTo(Response.Status.GATEWAY_TIMEOUT.getStatusCode());
-            assertThat(response.getEntity()).isEqualTo("timeout");
+            assertProblem(response, ChatDispatchService.RUNTIME_TIMEOUT);
         }
     }
 
     @Test
-    void chat_agentRuntimeFailed_returnsBadRequest() {
+    void chat_agentRuntimeFailed_returnsBadGatewayWithoutRuntimeDetails() {
         var agent = new Agent();
         when(agentService.findAgentByRequestContext(any())).thenReturn(agent);
         var request = new ChatRequestDTOV1();
         var runtimeResponse = new RuntimeChatResponse();
-        runtimeResponse.setMessage("failed");
+        runtimeResponse.setMessage("internal stack details");
         when(providerRuntimeClient.chat(any()))
                 .thenReturn(Response.status(Response.Status.BAD_REQUEST).entity(runtimeResponse).build());
 
         try (var response = chatDispatchService.chat(request)) {
-            assertThat(response.getStatus()).isEqualTo(Response.Status.BAD_REQUEST.getStatusCode());
-            assertThat(response.getEntity()).isEqualTo("failed");
+            assertThat(response.getStatus()).isEqualTo(Response.Status.BAD_GATEWAY.getStatusCode());
+            assertProblem(response, ChatDispatchService.RUNTIME_ERROR);
+            assertThat(((ProblemDetailResponseDTOV1) response.getEntity()).getDetail())
+                    .doesNotContain("internal stack details");
         }
     }
 
     @Test
-    void chat_agentRuntimeFailed_nullMessage_returnsAgentInvocationFailed() {
-        // Covers: result != null but result.getMessage() == null → "Agent invocation failed"
+    void chat_agentRuntimeFailed_nonJsonBody_returnsBadGateway() {
+        // The runtime error body is not parsed, so a non-JSON body cannot break the mapping.
         var agent = new Agent();
         when(agentService.findAgentByRequestContext(any())).thenReturn(agent);
-        var request = new ChatRequestDTOV1();
-        var runtimeResponse = new RuntimeChatResponse(); // message is null
-        when(providerRuntimeClient.chat(any()))
-                .thenReturn(Response.status(Response.Status.BAD_REQUEST).entity(runtimeResponse).build());
-
-        try (var response = chatDispatchService.chat(request)) {
-            assertThat(response.getStatus()).isEqualTo(Response.Status.BAD_REQUEST.getStatusCode());
-            assertThat(response.getEntity()).isEqualTo("Agent invocation failed");
-        }
-    }
-
-    @Test
-    @SuppressWarnings("unchecked")
-    void chat_agentRuntimeFailed_nullResult_returnsAgentInvocationFailed() {
-        // Covers: result == null → "Agent invocation failed"
-        var agent = new Agent();
-        when(agentService.findAgentByRequestContext(any())).thenReturn(agent);
-        var request = new ChatRequestDTOV1();
-
         var mockResponse = mock(Response.class);
-        when(mockResponse.getStatus()).thenReturn(Response.Status.BAD_REQUEST.getStatusCode());
+        when(mockResponse.getStatus()).thenReturn(Response.Status.INTERNAL_SERVER_ERROR.getStatusCode());
+        when(providerRuntimeClient.chat(any())).thenReturn(mockResponse);
+
+        try (var response = chatDispatchService.chat(new ChatRequestDTOV1())) {
+            assertThat(response.getStatus()).isEqualTo(Response.Status.BAD_GATEWAY.getStatusCode());
+            assertProblem(response, ChatDispatchService.RUNTIME_ERROR);
+        }
+    }
+
+    @Test
+    void chat_runtimeReturnsEmptyBody_returnsBadGatewayInvalidResponse() {
+        var agent = new Agent();
+        when(agentService.findAgentByRequestContext(any())).thenReturn(agent);
+        var mockResponse = mock(Response.class);
+        when(mockResponse.getStatus()).thenReturn(Response.Status.OK.getStatusCode());
         when(mockResponse.readEntity(RuntimeChatResponse.class)).thenReturn(null);
         when(providerRuntimeClient.chat(any())).thenReturn(mockResponse);
 
-        try (var response = chatDispatchService.chat(request)) {
-            assertThat(response.getStatus()).isEqualTo(Response.Status.BAD_REQUEST.getStatusCode());
-            assertThat(response.getEntity()).isEqualTo("Agent invocation failed");
+        try (var response = chatDispatchService.chat(new ChatRequestDTOV1())) {
+            assertThat(response.getStatus()).isEqualTo(Response.Status.BAD_GATEWAY.getStatusCode());
+            assertProblem(response, ChatDispatchService.RUNTIME_INVALID_RESPONSE);
         }
+    }
+
+    @Test
+    void chat_runtimeNotReachable_returnsRetryableServiceUnavailable() {
+        var agent = new Agent();
+        when(agentService.findAgentByRequestContext(any())).thenReturn(agent);
+        when(providerRuntimeClient.chat(any())).thenThrow(new RuntimeException("connect refused to 10.0.0.5"));
+
+        try (var response = chatDispatchService.chat(new ChatRequestDTOV1())) {
+            assertThat(response.getStatus()).isEqualTo(Response.Status.SERVICE_UNAVAILABLE.getStatusCode());
+            assertProblem(response, ChatDispatchService.RUNTIME_UNAVAILABLE);
+            assertThat(((ProblemDetailResponseDTOV1) response.getEntity()).getDetail())
+                    .doesNotContain("10.0.0.5");
+        }
+    }
+
+    private static void assertProblem(Response response, String errorCode) {
+        assertThat(response.getEntity()).isInstanceOf(ProblemDetailResponseDTOV1.class);
+        assertThat(((ProblemDetailResponseDTOV1) response.getEntity()).getErrorCode()).isEqualTo(errorCode);
     }
 
     @Test
